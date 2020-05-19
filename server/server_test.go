@@ -14,15 +14,18 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -871,6 +874,101 @@ func TestLameDuckMode(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestLameDuckModeInfo(t *testing.T) {
+	atomic.StoreInt64(&lameDuckModeInitialDelay, int64(time.Second))
+	defer atomic.StoreInt64(&lameDuckModeInitialDelay, lameDuckModeDefaultInitialDelay)
+
+	optsA := DefaultOptions()
+	optsA.Cluster.Host = "127.0.0.1"
+	optsA.Cluster.Port = -1
+	optsA.LameDuckDuration = 50 * time.Millisecond
+	optsA.DisableShortFirstPing = true
+	srvA := RunServer(optsA)
+	defer srvA.Shutdown()
+
+	c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", optsA.Port))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+	defer c.Close()
+
+	client := bufio.NewReaderSize(c, maxBufSize)
+
+	getInfo := func() *serverInfo {
+		l, err := client.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Error receiving info from server: %v\n", err)
+		}
+		var info serverInfo
+		if err = json.Unmarshal([]byte(l[5:]), &info); err != nil {
+			t.Fatalf("Could not parse INFO json: %v\n", err)
+		}
+		return &info
+	}
+	getInfo()
+	c.Write([]byte("CONNECT {\"protocol\":1,\"verbose\":false}\r\nPING\r\n"))
+	client.ReadString('\n')
+
+	optsB := DefaultOptions()
+	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	srvB := RunServer(optsB)
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	si := getInfo()
+	if len(si.ConnectURLs) != 2 {
+		t.Fatalf("Should have 2 URLs, got %v", si.ConnectURLs)
+	}
+	curlb := fmt.Sprintf("127.0.0.1:%d", optsB.Port)
+	expected := []string{fmt.Sprintf("127.0.0.1:%d", optsA.Port), curlb}
+	if !reflect.DeepEqual(expected, si.ConnectURLs) {
+		t.Fatalf("Expected %q, got %q", expected, si.ConnectURLs)
+	}
+
+	optsC := DefaultOptions()
+	optsC.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	srvC := RunServer(optsC)
+	defer srvC.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB, srvC)
+
+	si = getInfo()
+	if len(si.ConnectURLs) != 3 {
+		t.Fatalf("Should have 3 URLs, got %v", si.ConnectURLs)
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		srvA.lameDuckMode()
+	}()
+
+	si = getInfo()
+	if !si.LameDuckMode {
+		t.Fatal("Expected LameDuckMode to be true, it was not")
+	}
+	if len(si.ConnectURLs) != 2 {
+		t.Fatalf("Expected 2 URLs, got %v", si.ConnectURLs)
+	}
+	// Shutdown srvC and we should get an update, even if server
+	// is in LDM mode.
+	srvC.Shutdown()
+
+	si = getInfo()
+	// This update should not say that it is LDM.
+	if si.LameDuckMode {
+		t.Fatal("Expected LameDuckMode to be false, it was true")
+	}
+	if len(si.ConnectURLs) != 1 || si.ConnectURLs[0] != curlb {
+		t.Fatalf("Expected ConnectURLs to contain only server B (%q), got %q", curlb, si.ConnectURLs)
+	}
+
+	wg.Wait()
+	c.Close()
 }
 
 func TestServerValidateGatewaysOptions(t *testing.T) {

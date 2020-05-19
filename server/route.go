@@ -576,6 +576,7 @@ func (s *Server) sendAsyncInfoToClients() {
 	if s.cproto == 0 || s.shutdown {
 		return
 	}
+	info := s.copyInfo()
 
 	for _, c := range s.clients {
 		c.mu.Lock()
@@ -586,7 +587,7 @@ func (s *Server) sendAsyncInfoToClients() {
 		if c.opts.Protocol >= ClientProtoInfo && c.flags.isSet(firstPongSent) {
 			// sendInfo takes care of checking if the connection is still
 			// valid or not, so don't duplicate tests here.
-			c.enqueueProto(c.generateClientInfoJSON(s.copyInfo()))
+			c.enqueueProto(c.generateClientInfoJSON(info))
 		}
 		c.mu.Unlock()
 	}

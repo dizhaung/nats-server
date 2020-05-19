@@ -81,6 +81,7 @@ type Info struct {
 	Nonce             string   `json:"nonce,omitempty"`
 	Cluster           string   `json:"cluster,omitempty"`
 	ClientConnectURLs []string `json:"connect_urls,omitempty"` // Contains URLs a client can connect to.
+	LameDuckMode      bool     `json:"ldm,omitempty"`
 
 	// Route Specific
 	Import *SubjectPermission `json:"import,omitempty"`
@@ -1808,13 +1809,6 @@ func (s *Server) copyInfo() Info {
 		info.ClientConnectURLs = make([]string, len(s.info.ClientConnectURLs))
 		copy(info.ClientConnectURLs, s.info.ClientConnectURLs)
 	}
-	if s.nonceRequired() {
-		// Nonce handling
-		var raw [nonceLen]byte
-		nonce := raw[:]
-		s.generateNonce(nonce)
-		info.Nonce = string(nonce)
-	}
 	return info
 }
 
@@ -1837,6 +1831,13 @@ func (s *Server) createClient(conn net.Conn) *client {
 	// Grab JSON info string
 	s.mu.Lock()
 	info := s.copyInfo()
+	if s.nonceRequired() {
+		// Nonce handling
+		var raw [nonceLen]byte
+		nonce := raw[:]
+		s.generateNonce(nonce)
+		info.Nonce = string(nonce)
+	}
 	c.nonce = []byte(info.Nonce)
 	s.totalClients++
 	s.mu.Unlock()
@@ -2624,6 +2625,25 @@ func (s *Server) lameDuckMode() {
 	s.ldmCh = make(chan bool, 1)
 	s.listener.Close()
 	s.listener = nil
+	// Send an INFO update with the indication that this server is in
+	// LDM mode and with only URLs of other nodes.
+	s.info.LameDuckMode = true
+	// Clear this so that if there are further updates, we don't send our URLs.
+	s.clientConnectURLs = s.clientConnectURLs[:0]
+	// Reset content first.
+	s.info.ClientConnectURLs = s.info.ClientConnectURLs[:0]
+	// Only add the other nodes if we are allowed to.
+	if !s.getOpts().Cluster.NoAdvertise {
+		for url := range s.clientConnectURLsMap {
+			s.info.ClientConnectURLs = append(s.info.ClientConnectURLs, url)
+		}
+	}
+	// Send to all registered clients that support async INFO protocols.
+	s.sendAsyncInfoToClients()
+	// We now clear the info.LameDuckMode flag so that if there are
+	// cluster updates and we send the INFO, we don't have the boolean
+	// set which would cause multiple LDM notifications to clients.
+	s.info.LameDuckMode = false
 	s.mu.Unlock()
 
 	// Wait for accept loop to be done to make sure that no new
